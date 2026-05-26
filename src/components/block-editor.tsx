@@ -14,6 +14,7 @@ import { Block } from "@/lib/types";
 
 const SLASH_COMMANDS = [
   { command: "/todo", label: "To-do", type: "todo" as const, icon: "☐" },
+  { command: "/list", label: "Bullet List", type: "list" as const, icon: "•" },
   { command: "/number", label: "Numbered List", type: "number" as const, icon: "1." },
   { command: "/h1", label: "Heading 1", type: "h1" as const, icon: "H₁" },
   { command: "/h2", label: "Heading 2", type: "h2" as const, icon: "H₂" },
@@ -223,6 +224,9 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
             type = "todo";
             content = line.replace(/^-\s*\[[ xX]?\]\s*/, "");
             checked = /\[x\]/i.test(line);
+          } else if (line.match(/^[-*]\s+/)) {
+            type = "list";
+            content = line.replace(/^[-*]\s+/, "");
           } else if (line.match(/^[0-9]+\. /)) {
             type = "number";
             content = line.replace(/^[0-9]+\. /, "");
@@ -356,6 +360,13 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
             updateBlock(id, { type: "todo", content: "", checked });
             return;
           }
+          // Bullet list: - or *
+          if (rawText === "-" || rawText === "*") {
+            e.preventDefault();
+            if (el) { el.textContent = ""; el.dataset.init = ""; }
+            updateBlock(id, { type: "list", content: "" });
+            return;
+          }
           // Number: 1.
           if (rawText === "1.") {
             e.preventDefault();
@@ -407,6 +418,9 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         
+        // Determine if we should continue the current block type
+        const continueType = (block.type === "list" || block.type === "number" || block.type === "todo") ? block.type : "text";
+        
         // If at start of line, insert BEFORE
         const sel = window.getSelection();
         if (sel && sel.rangeCount > 0) {
@@ -417,7 +431,7 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
           }
         }
         
-        addBlockAfter(id);
+        addBlockAfter(id, continueType);
       }
 
       // Backspace on empty → downgrade type, then delete
@@ -477,6 +491,8 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
         return "text-[10px] font-mono bg-neutral-50 px-1.5 py-1 rounded border border-neutral-100";
       case "divider":
         return "h-px bg-neutral-200 my-2";
+      case "list":
+        return "text-xs leading-relaxed";
       default:
         return "text-xs leading-relaxed";
     }
@@ -488,6 +504,8 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
         return "To-do";
       case "number":
         return "Step";
+      case "list":
+        return "List item";
       case "h1":
         return "Heading 1";
       case "h2":
@@ -570,6 +588,11 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
             {block.type === "number" && (
               <div className="mt-[3px] text-[10px] font-bold text-neutral-900 shrink-0 min-w-[14px]">
                 {blocks.filter((b, i) => b.type === "number" && i <= blocks.indexOf(block)).length}.
+              </div>
+            )}
+            {block.type === "list" && (
+              <div className="mt-[3px] text-[10px] text-neutral-500 shrink-0 min-w-[14px] text-center">
+                •
               </div>
             )}
 

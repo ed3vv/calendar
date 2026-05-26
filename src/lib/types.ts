@@ -1,6 +1,6 @@
 export interface Block {
   id: string;
-  type: "text" | "todo" | "h1" | "h2" | "h3" | "number" | "quote" | "divider" | "code";
+  type: "text" | "todo" | "h1" | "h2" | "h3" | "number" | "quote" | "divider" | "code" | "list";
   content: string;
   checked?: boolean;
 }
