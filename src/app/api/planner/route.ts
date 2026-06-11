@@ -33,14 +33,16 @@ export async function GET() {
 
 export async function POST(request: NextRequest) {
   const body = await request.json();
-  const { date, blocks } = body as { date: string; blocks: Block[] };
-
-  if (!date) {
-    return Response.json({ error: "date is required" }, { status: 400 });
-  }
+  const { date, blocks, positions } = body as { date: string; blocks?: Block[]; positions?: any };
 
   const data = readData();
-  data[date] = blocks;
+  if (positions) {
+    (data as any)["__monthPositions"] = positions;
+  } else if (date && blocks) {
+    data[date] = blocks;
+  } else {
+    return Response.json({ error: "date/blocks or positions are required" }, { status: 400 });
+  }
   writeData(data);
 
   return Response.json({ success: true });

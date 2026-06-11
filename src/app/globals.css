@@ -127,4 +127,18 @@
   html {
     @apply font-sans;
   }
+  sup {
+    font-size: 0.75em;
+    line-height: 0;
+    position: relative;
+    vertical-align: super;
+    top: -0.2em;
+  }
+  sub {
+    font-size: 0.75em;
+    line-height: 0;
+    position: relative;
+    vertical-align: sub;
+    bottom: -0.2em;
+  }
 }

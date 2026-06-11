@@ -29,6 +29,36 @@ function generateId() {
   return Math.random().toString(36).substring(2, 9);
 }
 
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function getSafeHTML(content: string): string {
+  if (!content) return "";
+  if (
+    content.includes("<sup>") ||
+    content.includes("<sub>") ||
+    content.includes("<br>")
+  ) {
+    return content;
+  }
+  return escapeHtml(content);
+}
+
+function cleanEmptyTags(html: string): string {
+  if (!html) return "";
+  let cleaned = html.replace(/\u200B/g, "");
+  cleaned = cleaned
+    .replace(/<sup[^>]*>\s*<\/sup>/gi, "")
+    .replace(/<sub[^>]*>\s*<\/sub>/gi, "");
+  return cleaned;
+}
+
 // ─── Component ──────────────────────────────────────────────────────────────
 
 interface BlockEditorProps {
@@ -277,10 +307,18 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
 
   const handleInput = useCallback(
     (id: string, e: React.FormEvent<HTMLElement>) => {
-      const rawText = (e.target as HTMLElement).textContent || "";
-      const text = rawText.replace(/\u00a0/g, " ");
+      const el = e.target as HTMLElement;
+      const rawText = el.textContent || "";
+      const text = rawText.replace(/\u00a0/g, " ").replace(/\u200b/g, "");
 
-      updateBlock(id, { content: text });
+      let html = el.innerHTML || "";
+      
+      // If there's no actual text and no formatting tags, clean it up as empty string
+      if (text === "" && !html.includes("<sup") && !html.includes("<sub")) {
+        html = "";
+      }
+
+      updateBlock(id, { content: html });
 
       const slashMatch = text.match(/\/(\S*)$/);
       if (slashMatch) {
@@ -343,6 +381,152 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
           e.preventDefault();
           setSlashMenu(null);
           return;
+        }
+      }
+
+      // Subscript / Superscript navigation and toggles
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount > 0) {
+        const range = sel.getRangeAt(0);
+        let parent: Node | null = sel.anchorNode;
+        let insideInlineTag = false;
+        let inlineElement: HTMLElement | null = null;
+        let inlineTagType: "sup" | "sub" | null = null;
+
+        while (parent && parent !== e.currentTarget) {
+          if (parent.nodeType === Node.ELEMENT_NODE) {
+            const tagName = (parent as HTMLElement).tagName.toLowerCase();
+            if (tagName === "sup" || tagName === "sub") {
+              insideInlineTag = true;
+              inlineElement = parent as HTMLElement;
+              inlineTagType = tagName as "sup" | "sub";
+              break;
+            }
+          }
+          parent = parent.parentNode;
+        }
+
+        // 1. Toggles: ^ and _
+        if (e.key === "^" || e.key === "_") {
+          e.preventDefault();
+          const targetTag = e.key === "^" ? "sup" : "sub";
+
+          if (insideInlineTag && inlineElement && inlineTagType === targetTag) {
+            // Exit current tag
+            const nextSibling = inlineElement.nextSibling;
+            if (nextSibling && nextSibling.nodeType === Node.TEXT_NODE) {
+              range.setStart(nextSibling, 0);
+            } else {
+              const emptyText = document.createTextNode("");
+              inlineElement.parentNode?.insertBefore(emptyText, nextSibling);
+              range.setStart(emptyText, 0);
+            }
+            range.collapse(true);
+            sel.removeAllRanges();
+            sel.addRange(range);
+          } else {
+            // Exit previous tag first if it is the other type
+            if (insideInlineTag && inlineElement) {
+              const nextSibling = inlineElement.nextSibling;
+              if (nextSibling && nextSibling.nodeType === Node.TEXT_NODE) {
+                range.setStart(nextSibling, 0);
+              } else {
+                const emptyText = document.createTextNode("");
+                inlineElement.parentNode?.insertBefore(emptyText, nextSibling);
+                range.setStart(emptyText, 0);
+              }
+              range.collapse(true);
+              sel.removeAllRanges();
+              sel.addRange(range);
+            }
+
+            // Create and insert new tag
+            const elem = document.createElement(targetTag);
+            elem.appendChild(document.createTextNode("\u200B")); // zero-width space
+            range.deleteContents();
+            range.insertNode(elem);
+
+            // Position selection inside the tag (after zero-width space)
+            range.setStart(elem.firstChild!, 1);
+            range.collapse(true);
+            sel.removeAllRanges();
+            sel.addRange(range);
+          }
+          updateBlock(id, { content: e.currentTarget.innerHTML });
+          return;
+        }
+
+        // 2. Exiting via Space
+        if (e.key === " ") {
+          if (insideInlineTag && inlineElement) {
+            e.preventDefault();
+            const nextSibling = inlineElement.nextSibling;
+            if (nextSibling && nextSibling.nodeType === Node.TEXT_NODE) {
+              const txt = nextSibling as Text;
+              txt.insertData(0, " ");
+              range.setStart(txt, 1);
+            } else {
+              const spaceNode = document.createTextNode(" ");
+              inlineElement.parentNode?.insertBefore(spaceNode, nextSibling);
+              range.setStart(spaceNode, 1);
+            }
+            range.collapse(true);
+            sel.removeAllRanges();
+            sel.addRange(range);
+            updateBlock(id, { content: e.currentTarget.innerHTML });
+            return;
+          }
+        }
+
+        // 3. Exiting via ArrowRight
+        if (e.key === "ArrowRight") {
+          if (insideInlineTag && inlineElement) {
+            const textLength = sel.anchorNode?.textContent?.length || 0;
+            if (sel.anchorOffset === textLength) {
+              e.preventDefault();
+              const nextSibling = inlineElement.nextSibling;
+              if (nextSibling && nextSibling.nodeType === Node.TEXT_NODE) {
+                range.setStart(nextSibling, 0);
+              } else {
+                const emptyText = document.createTextNode("");
+                inlineElement.parentNode?.insertBefore(emptyText, nextSibling);
+                range.setStart(emptyText, 0);
+              }
+              range.collapse(true);
+              sel.removeAllRanges();
+              sel.addRange(range);
+              return;
+            }
+          }
+        }
+
+        // 4. Deleting empty/zero-width space tags via Backspace
+        if (e.key === "Backspace") {
+          if (insideInlineTag && inlineElement) {
+            const text = inlineElement.textContent || "";
+            if (text === "" || text === "\u200B") {
+              e.preventDefault();
+              const parentNode = inlineElement.parentNode;
+              const prevSibling = inlineElement.previousSibling;
+              if (parentNode) {
+                inlineElement.remove();
+                if (prevSibling) {
+                  if (prevSibling.nodeType === Node.TEXT_NODE) {
+                    range.setStart(prevSibling, prevSibling.textContent?.length || 0);
+                  } else {
+                    range.setStartAfter(prevSibling);
+                  }
+                } else {
+                  range.setStart(parentNode, 0);
+                }
+                range.collapse(true);
+                sel.removeAllRanges();
+                sel.addRange(range);
+                updateBlock(id, { content: e.currentTarget.innerHTML });
+              }
+              return;
+            }
+          }
         }
       }
 
@@ -532,9 +716,10 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
           <div
             key={block.id}
             className={`py-px ${blockStyle(block.type)} text-neutral-300`}
-          >
-            {block.content || placeholderText(block.type)}
-          </div>
+            dangerouslySetInnerHTML={{
+              __html: getSafeHTML(block.content) || placeholderText(block.type),
+            }}
+          />
         ))}
       </div>
     );
@@ -602,9 +787,16 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
                 <div
                   ref={(el) => {
                     blockRefs.current[block.id] = el;
-                    if (el && !el.dataset.init) {
-                      el.dataset.init = "1";
-                      el.textContent = block.content;
+                    if (el) {
+                      const isFocused = document.activeElement === el;
+                      const needsUpdate = !el.dataset.init || 
+                        (isUndoRedoing.current && el.innerHTML !== block.content) ||
+                        (!isFocused && el.innerHTML !== block.content);
+                      
+                      if (needsUpdate) {
+                        el.dataset.init = "1";
+                        el.innerHTML = getSafeHTML(block.content);
+                      }
                     }
                   }}
                   contentEditable
@@ -624,7 +816,15 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
                     if (slashMenu && slashMenu.blockId !== block.id)
                       setSlashMenu(null);
                   }}
-                  onBlur={() => setFocusedId(null)}
+                  onBlur={(e) => {
+                    setFocusedId(null);
+                    const el = e.currentTarget;
+                    const cleanedHtml = cleanEmptyTags(el.innerHTML);
+                    if (cleanedHtml !== el.innerHTML) {
+                      el.innerHTML = cleanedHtml;
+                      updateBlock(block.id, { content: cleanedHtml });
+                    }
+                  }}
                 />
               )}
 

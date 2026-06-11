@@ -22,6 +22,12 @@ function formatDate(year: number, month: number, day: number) {
   )}`;
 }
 
+function isLocalNetwork(): boolean {
+  if (typeof window === "undefined") return false;
+  const h = window.location.hostname;
+  return h === "localhost" || h === "127.0.0.1" || h.endsWith(".local");
+}
+
 function getMonthWeeks(year: number, month: number): (number | null)[][] {
   const daysInMonth = getDaysInMonth(year, month);
   const firstDay = getFirstDayOfWeek(year, month);
@@ -83,6 +89,7 @@ export default function Home() {
   const [loaded, setLoaded] = useState(false);
   const saveTimeout = useRef<NodeJS.Timeout | null>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
+  const contentLayerRef = useRef<HTMLDivElement>(null);
   const initializedRef = useRef(false);
   const defaultBlocksRef = useRef<Record<string, Block[]>>({});
 
@@ -172,6 +179,13 @@ export default function Home() {
   const saveMonthPositions = useCallback((positions: Record<string, { x: number; y: number; name?: string }>) => {
     setMonthPositions(positions);
     localStorage.setItem("planner-month-positions", JSON.stringify(positions));
+    if (isLocalNetwork()) {
+      fetch("/api/planner", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ date: "__monthPositions", positions }),
+      });
+    }
   }, []);
 
   // ─── Sync refs ────────────────────────────────────────────────────────
@@ -244,12 +258,6 @@ export default function Home() {
     return pages;
   }, [monthPositions]);
 
-  // ─── Localhost detection ───────────────────────────────────────────
-  const isLocalNetwork = () => {
-    const h = window.location.hostname;
-    return h === "localhost" || h === "127.0.0.1" || h.endsWith(".local");
-  };
-
   const [isLocal, setIsLocal] = useState(false);
   useEffect(() => {
     setIsLocal(isLocalNetwork());
@@ -258,25 +266,29 @@ export default function Home() {
   // ─── Data fetching ──────────────────────────────────────────────────
 
   useEffect(() => {
+    // 1. Try to load initial data from localStorage first as a fallback/immediate load
     const savedData = localStorage.getItem("planner-data");
-    
-    // If we have local storage, use it (works for everyone)
     if (savedData) {
       try {
         setData(JSON.parse(savedData));
-        setLoaded(true);
-        return;
       } catch (e) {
         console.error("Failed to parse saved data", e);
       }
     }
 
-    // If no local storage AND we are on local network, pull from the JSON file
+    // 2. Fetch the latest database state if on local network (single source of truth)
     if (isLocalNetwork()) {
       fetch("/api/planner")
         .then((r) => r.json())
         .then((d) => {
-          setData(d);
+          const { __monthPositions, ...plannerData } = d;
+          setData(plannerData);
+          localStorage.setItem("planner-data", JSON.stringify(plannerData));
+          
+          if (__monthPositions) {
+            setMonthPositions(__monthPositions);
+            localStorage.setItem("planner-month-positions", JSON.stringify(__monthPositions));
+          }
           setLoaded(true);
         })
         .catch(() => setLoaded(true));
@@ -482,6 +494,21 @@ export default function Home() {
   }, [importText, handleImportData]);
 
 
+  // ─── Performance optimized transform helper ──────────────────────────
+
+  const applyTransform = useCallback((newScale: number, newX: number, newY: number) => {
+    scaleRef.current = newScale;
+    offsetRef.current = { x: newX, y: newY };
+    
+    if (contentLayerRef.current) {
+      contentLayerRef.current.style.transform = `translate(${newX}px, ${newY}px) scale(${newScale})`;
+    }
+    if (canvasRef.current) {
+      canvasRef.current.style.backgroundSize = `${24 * newScale}px ${24 * newScale}px`;
+      canvasRef.current.style.backgroundPosition = `${newX}px ${newY}px`;
+    }
+  }, []);
+
   // ─── Smooth animation helper ────────────────────────────────────────
 
   const animateToOffset = useCallback(
@@ -498,21 +525,22 @@ export default function Home() {
         const t = Math.min(elapsed / duration, 1);
         const ease = 1 - Math.pow(1 - t, 3); // ease-out cubic
 
-        setOffset({
-          x: startX + (targetX - startX) * ease,
-          y: startY + (targetY - startY) * ease,
-        });
+        const currentX = startX + (targetX - startX) * ease;
+        const currentY = startY + (targetY - startY) * ease;
+        
+        applyTransform(scaleRef.current, currentX, currentY);
 
         if (t < 1) {
           animationRef.current = requestAnimationFrame(step);
         } else {
+          setOffset({ x: targetX, y: targetY }); // sync to React state at the end
           animationRef.current = null;
         }
       };
 
       animationRef.current = requestAnimationFrame(step);
     },
-    []
+    [applyTransform]
   );
 
   // ─── Navigation ──────────────────────────────────────────────────────
@@ -565,6 +593,8 @@ export default function Home() {
     const el = canvasRef.current;
     if (!el) return;
 
+    let wheelTimeout: NodeJS.Timeout | null = null;
+
     const handler = (e: WheelEvent) => {
       e.preventDefault();
 
@@ -589,23 +619,32 @@ export default function Home() {
         );
         const ratio = newScale / currentScale;
 
-        setOffset({
-          x: cx - (cx - currentOffset.x) * ratio,
-          y: cy - (cy - currentOffset.y) * ratio,
-        });
-        setScale(newScale);
+        const newX = cx - (cx - currentOffset.x) * ratio;
+        const newY = cy - (cy - currentOffset.y) * ratio;
+
+        applyTransform(newScale, newX, newY);
       } else {
         // Two-finger scroll → pan
-        setOffset((prev) => ({
-          x: prev.x - e.deltaX,
-          y: prev.y - e.deltaY,
-        }));
+        const newX = offsetRef.current.x - e.deltaX;
+        const newY = offsetRef.current.y - e.deltaY;
+
+        applyTransform(scaleRef.current, newX, newY);
       }
+
+      // Sync React state after scrolling stops
+      if (wheelTimeout) clearTimeout(wheelTimeout);
+      wheelTimeout = setTimeout(() => {
+        setScale(scaleRef.current);
+        setOffset(offsetRef.current);
+      }, 150);
     };
 
     el.addEventListener("wheel", handler, { passive: false });
-    return () => el.removeEventListener("wheel", handler);
-  }, [loaded]);
+    return () => {
+      el.removeEventListener("wheel", handler);
+      if (wheelTimeout) clearTimeout(wheelTimeout);
+    };
+  }, [loaded, applyTransform]);
 
   // ─── Touch handlers (mobile pan + pinch-zoom) ───────────────────────
 
@@ -655,10 +694,9 @@ export default function Home() {
         }
         if (isTouchPanning) {
           e.preventDefault();
-          setOffset({
-            x: touchRef.current.startOffsetX + dx,
-            y: touchRef.current.startOffsetY + dy,
-          });
+          const newX = touchRef.current.startOffsetX + dx;
+          const newY = touchRef.current.startOffsetY + dy;
+          applyTransform(scaleRef.current, newX, newY);
         }
       } else if (e.touches.length === 2) {
         e.preventDefault();
@@ -673,17 +711,18 @@ export default function Home() {
         const cy = center.y - rect.top;
         const scaleRatio = newScale / touchRef.current.lastScale;
 
-        setScale(newScale);
-        setOffset({
-          x: cx - (cx - touchRef.current.startOffsetX) * scaleRatio,
-          y: cy - (cy - touchRef.current.startOffsetY) * scaleRatio,
-        });
+        const newX = cx - (cx - touchRef.current.startOffsetX) * scaleRatio;
+        const newY = cy - (cy - touchRef.current.startOffsetY) * scaleRatio;
+
+        applyTransform(newScale, newX, newY);
       }
     };
 
     const handleTouchEnd = () => {
       isTouchPanning = false;
       isTouchZooming = false;
+      setScale(scaleRef.current);
+      setOffset(offsetRef.current);
     };
 
     el.addEventListener("touchstart", handleTouchStart, { passive: false });
@@ -694,7 +733,7 @@ export default function Home() {
       el.removeEventListener("touchmove", handleTouchMove);
       el.removeEventListener("touchend", handleTouchEnd);
     };
-  }, [loaded]);
+  }, [loaded, applyTransform]);
 
 
   // ─── Keyboard zoom handler (Cmd+ / Cmd-) ────────────────────────────
@@ -734,6 +773,7 @@ export default function Home() {
       setMonthPositions((prev) => ({
         ...prev,
         [draggingMonth]: {
+          ...prev[draggingMonth],
           x: dragMonthStart.current.cardX + dx,
           y: dragMonthStart.current.cardY + dy,
         },
@@ -741,7 +781,10 @@ export default function Home() {
     };
 
     const handleMouseUp = () => {
-      saveMonthPositions(monthPositions);
+      setMonthPositions((prev) => {
+        localStorage.setItem("planner-month-positions", JSON.stringify(prev));
+        return prev;
+      });
       setDraggingMonth(null);
     };
 
@@ -805,13 +848,17 @@ export default function Home() {
     const handlePointerMove = (e: globalThis.PointerEvent) => {
       const dx = e.clientX - dragStartRef.current.mouseX;
       const dy = e.clientY - dragStartRef.current.mouseY;
-      setOffset({
-        x: dragStartRef.current.offsetX + dx,
-        y: dragStartRef.current.offsetY + dy,
-      });
+      applyTransform(
+        scaleRef.current,
+        dragStartRef.current.offsetX + dx,
+        dragStartRef.current.offsetY + dy
+      );
     };
 
-    const handlePointerUp = () => setIsDraggingCanvas(false);
+    const handlePointerUp = () => {
+      setIsDraggingCanvas(false);
+      setOffset(offsetRef.current);
+    };
 
     document.addEventListener("pointermove", handlePointerMove);
     document.addEventListener("pointerup", handlePointerUp);
@@ -819,7 +866,7 @@ export default function Home() {
       document.removeEventListener("pointermove", handlePointerMove);
       document.removeEventListener("pointerup", handlePointerUp);
     };
-  }, [isDraggingCanvas]);
+  }, [isDraggingCanvas, applyTransform]);
 
   // ─── Render ──────────────────────────────────────────────────────────
 
@@ -980,6 +1027,7 @@ export default function Home() {
       >
         {/* Transformed content layer */}
         <div
+          ref={contentLayerRef}
           style={{
             position: "absolute",
             top: 0,
