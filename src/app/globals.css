@@ -141,4 +141,10 @@
     vertical-align: sub;
     bottom: -0.2em;
   }
+  mark {
+    background-color: #fef08a; /* fallback; inline style overrides per color */
+    color: inherit;
+    border-radius: 2px;
+    padding: 0 1px;
+  }
 }

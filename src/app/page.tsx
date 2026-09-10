@@ -1,9 +1,12 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { useRouter } from "next/navigation";
 import { Block, PlannerData } from "@/lib/types";
 import BlockEditor from "@/components/block-editor";
 import { Button } from "@/components/ui/button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { createClient } from "@/lib/supabase/client";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -22,12 +25,6 @@ function formatDate(year: number, month: number, day: number) {
   )}`;
 }
 
-function isLocalNetwork(): boolean {
-  if (typeof window === "undefined") return false;
-  const h = window.location.hostname;
-  return h === "localhost" || h === "127.0.0.1" || h.endsWith(".local");
-}
-
 function getMonthWeeks(year: number, month: number): (number | null)[][] {
   const daysInMonth = getDaysInMonth(year, month);
   const firstDay = getFirstDayOfWeek(year, month);
@@ -43,6 +40,15 @@ function getMonthWeeks(year: number, month: number): (number | null)[][] {
 
 function monthToGlobalIndex(year: number, month: number) {
   return year * 12 + month;
+}
+
+function parseMonthKey(key: string) {
+  const match = /^(-?\d+)-(\d|1[01])$/.exec(key);
+  if (!match) return null;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  return Number.isSafeInteger(year) ? { year, month } : null;
 }
 
 const MONTH_NAMES = [
@@ -68,26 +74,45 @@ const MIN_ROW_HEIGHT = 60;
 const HEADER_HEIGHT = 36;
 const TITLE_HEIGHT = 44;
 const PAGE_GAP = 80;
-const RENDER_RANGE = 2; // Render focused ± 2 months = 5 pages
+const RENDER_RANGE = 0; // Only the focused fallback month; added months are explicit.
+// Stored in the existing position row so removed months stay hidden after reload.
+const REMOVED_MONTH_MARKER = "__removed__";
+const LEGACY_REMOVED_MONTH_PREFIX = "removed-month:";
+// Fixed reference point for month grid math — NOT "today", so a given month's
+// default x position is the same in every session. If it were derived from
+// "today" (as it used to be), the same real-world month would compute to a
+// different x in each session, and once positions are persisted per-month
+// (see the "assign missing positions" effect below) two unrelated months
+// visited in different sessions could end up saved at the same coordinates.
+const EPOCH_GLOBAL_INDEX = monthToGlobalIndex(2000, 0);
 
 // ─── Component ──────────────────────────────────────────────────────────────
 
 export default function Home() {
+  const router = useRouter();
+  const supabase = useMemo(() => createClient(), []);
   const today = new Date();
   const todayStr = formatDate(
     today.getFullYear(),
     today.getMonth(),
     today.getDate()
   );
-  const anchorGlobal = useRef(
-    monthToGlobalIndex(today.getFullYear(), today.getMonth())
-  ).current;
+  // ─── Auth ─────────────────────────────────────────────────────────────
+
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const userIdRef = useRef<string | null>(null);
+
+  const handleSignOut = useCallback(async () => {
+    await supabase.auth.signOut();
+    router.push("/login");
+    router.refresh();
+  }, [supabase, router]);
 
   // ─── Data ─────────────────────────────────────────────────────────────
 
   const [data, setData] = useState<PlannerData>({});
   const [loaded, setLoaded] = useState(false);
-  const saveTimeout = useRef<NodeJS.Timeout | null>(null);
+  const saveTimeouts = useRef<Record<string, NodeJS.Timeout>>({});
   const canvasRef = useRef<HTMLDivElement>(null);
   const contentLayerRef = useRef<HTMLDivElement>(null);
   const initializedRef = useRef(false);
@@ -156,6 +181,9 @@ export default function Home() {
     }
   }, []);
 
+  // Month positions ref for stable functional updates
+  const monthPositionsRef = useRef<Record<string, { x: number; y: number; name?: string }>>({});
+
   // ─── Month card positions & selection ─────────────────────────────
 
   const [monthPositions, setMonthPositions] = useState<Record<string, { x: number; y: number; name?: string }>>({}); 
@@ -165,28 +193,40 @@ export default function Home() {
   const [showMonthPicker, setShowMonthPicker] = useState(false);
   const [pickerYear, setPickerYear] = useState(today.getFullYear());
 
-  // Load month positions from localStorage
-  useEffect(() => {
-    const saved = localStorage.getItem("planner-month-positions");
-    if (saved) {
-      try {
-        setMonthPositions(JSON.parse(saved));
-      } catch { /* ignore */ }
-    }
-  }, []);
+  // Save month positions — accepts a value or updater function to avoid stale closures
+  const saveMonthPositions = useCallback((
+    updater: Record<string, { x: number; y: number; name?: string }> | ((prev: Record<string, { x: number; y: number; name?: string }>) => Record<string, { x: number; y: number; name?: string }>)
+  ) => {
+    setMonthPositions((prev) => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      monthPositionsRef.current = next;
 
-  // Save month positions
-  const saveMonthPositions = useCallback((positions: Record<string, { x: number; y: number; name?: string }>) => {
-    setMonthPositions(positions);
-    localStorage.setItem("planner-month-positions", JSON.stringify(positions));
-    if (isLocalNetwork()) {
-      fetch("/api/planner", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ date: "__monthPositions", positions }),
-      });
-    }
-  }, []);
+      const uid = userIdRef.current;
+      if (uid) {
+        const removedKeys = Object.keys(prev).filter((k) => !(k in next));
+        const rows = Object.entries(next).map(([key, pos]) => ({
+          user_id: uid,
+          month_key: key,
+          x: pos.x,
+          y: pos.y,
+          name: pos.name ?? null,
+        }));
+        if (rows.length > 0) {
+          supabase.from("month_positions").upsert(rows).then();
+        }
+        if (removedKeys.length > 0) {
+          supabase
+            .from("month_positions")
+            .delete()
+            .eq("user_id", uid)
+            .in("month_key", removedKeys)
+            .then();
+        }
+      }
+
+      return next;
+    });
+  }, [supabase]);
 
   // ─── Sync refs ────────────────────────────────────────────────────────
 
@@ -208,13 +248,14 @@ export default function Home() {
   const pageWidth = colWidths.reduce((a, b) => a + b, 0);
   const PAGE_STRIDE = pageWidth + PAGE_GAP;
 
-  // Stable global X position for any month
+  // Stable global X position for any month, relative to a fixed epoch (not
+  // "today") so it's identical across sessions.
   const getMonthX = useCallback(
     (year: number, month: number) => {
       const idx = monthToGlobalIndex(year, month);
-      return (idx - anchorGlobal) * PAGE_STRIDE;
+      return (idx - EPOCH_GLOBAL_INDEX) * PAGE_STRIDE;
     },
-    [anchorGlobal, PAGE_STRIDE]
+    [PAGE_STRIDE]
   );
 
   // Months to render: use stored positions, fallback to computed
@@ -225,9 +266,16 @@ export default function Home() {
     // First: add all months that have custom positions
     for (const [key, pos] of Object.entries(monthPositions)) {
       if (key.startsWith("doc-")) continue;
-      const [y, m] = key.split("-").map(Number);
-      pages.push({ year: y, month: m, x: pos.x, y: pos.y });
+      const parsedKey = parseMonthKey(key);
+      if (!parsedKey) continue;
       seen.add(key);
+      if (pos.name === REMOVED_MONTH_MARKER) continue;
+      pages.push({
+        year: parsedKey.year,
+        month: parsedKey.month,
+        x: pos.x,
+        y: pos.y,
+      });
     }
 
     // Then: add months in the sliding window that aren't already placed
@@ -258,44 +306,116 @@ export default function Home() {
     return pages;
   }, [monthPositions]);
 
-  const [isLocal, setIsLocal] = useState(false);
-  useEffect(() => {
-    setIsLocal(isLocalNetwork());
-  }, []);
-
   // ─── Data fetching ──────────────────────────────────────────────────
 
   useEffect(() => {
-    // 1. Try to load initial data from localStorage first as a fallback/immediate load
-    const savedData = localStorage.getItem("planner-data");
-    if (savedData) {
-      try {
-        setData(JSON.parse(savedData));
-      } catch (e) {
-        console.error("Failed to parse saved data", e);
-      }
-    }
+    let cancelled = false;
 
-    // 2. Fetch the latest database state if on local network (single source of truth)
-    if (isLocalNetwork()) {
-      fetch("/api/planner")
-        .then((r) => r.json())
-        .then((d) => {
-          const { __monthPositions, ...plannerData } = d;
-          setData(plannerData);
-          localStorage.setItem("planner-data", JSON.stringify(plannerData));
-          
-          if (__monthPositions) {
-            setMonthPositions(__monthPositions);
-            localStorage.setItem("planner-month-positions", JSON.stringify(__monthPositions));
+    (async () => {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+
+      if (cancelled) return;
+
+      if (!user) {
+        // proxy.ts should already have redirected unauthenticated visitors
+        // to /login before this ever mounts, but guard anyway.
+        setLoaded(true);
+        return;
+      }
+
+      userIdRef.current = user.id;
+      setUserEmail(user.email ?? null);
+
+      const [{ data: entries }, { data: positions }] = await Promise.all([
+        supabase.from("planner_entries").select("date_key, blocks"),
+        supabase.from("month_positions").select("month_key, x, y, name"),
+      ]);
+
+      if (cancelled) return;
+
+      const plannerData: PlannerData = {};
+      (entries ?? []).forEach((row) => {
+        plannerData[row.date_key] = row.blocks;
+      });
+      setData(plannerData);
+
+      const positionsMap: Record<string, { x: number; y: number; name?: string }> = {};
+      const legacyRemovedRows: {
+        legacyKey: string;
+        monthKey: string;
+        x: number;
+        y: number;
+      }[] = [];
+      (positions ?? []).forEach((row) => {
+        if (row.month_key.startsWith(LEGACY_REMOVED_MONTH_PREFIX)) {
+          const monthKey = row.month_key.slice(
+            LEGACY_REMOVED_MONTH_PREFIX.length
+          );
+          if (parseMonthKey(monthKey)) {
+            legacyRemovedRows.push({
+              legacyKey: row.month_key,
+              monthKey,
+              x: row.x,
+              y: row.y,
+            });
           }
-          setLoaded(true);
-        })
-        .catch(() => setLoaded(true));
-    } else {
+          return;
+        }
+        positionsMap[row.month_key] = {
+          x: row.x,
+          y: row.y,
+          ...(row.name ? { name: row.name } : {}),
+        };
+      });
+
+      const normalizedRemovedRows = legacyRemovedRows
+        .filter(({ monthKey }) => positionsMap[monthKey] === undefined)
+        .map(({ monthKey, x, y }) => {
+          positionsMap[monthKey] = { x, y, name: REMOVED_MONTH_MARKER };
+          return {
+            user_id: user.id,
+            month_key: monthKey,
+            x,
+            y,
+            name: REMOVED_MONTH_MARKER,
+          };
+        });
+
+      if (legacyRemovedRows.length > 0) {
+        const removeLegacyRows = () =>
+          supabase
+            .from("month_positions")
+            .delete()
+            .eq("user_id", user.id)
+            .in(
+              "month_key",
+              legacyRemovedRows.map(({ legacyKey }) => legacyKey)
+            )
+            .then();
+
+        if (normalizedRemovedRows.length > 0) {
+          supabase
+            .from("month_positions")
+            .upsert(normalizedRemovedRows)
+            .then(({ error }) => {
+              if (!error) removeLegacyRows();
+            });
+        } else {
+          removeLegacyRows();
+        }
+      }
+      monthPositionsRef.current = positionsMap;
+      setMonthPositions(positionsMap);
+
       setLoaded(true);
-    }
-  }, []);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [supabase]);
 
   // ─── Center on mount ────────────────────────────────────────────────
 
@@ -303,49 +423,49 @@ export default function Home() {
     if (canvasRef.current && !initializedRef.current && loaded) {
       initializedRef.current = true;
       const { clientWidth, clientHeight } = canvasRef.current;
+      const s = scaleRef.current;
       const weeks = getMonthWeeks(focusedYear, focusedMonth);
-      const calH =
-        TITLE_HEIGHT + HEADER_HEIGHT + weeks.length * DEFAULT_ROW_HEIGHT;
-      setOffset({
-        x: Math.max(60, (clientWidth - pageWidth) / 2),
-        y: Math.max(40, (clientHeight - calH) / 2),
-      });
+      const calH = TITLE_HEIGHT + HEADER_HEIGHT + weeks.length * DEFAULT_ROW_HEIGHT;
+
+      // Use saved card position if available, otherwise computed position
+      const currentMonthKey = `${focusedYear}-${focusedMonth}`;
+      const savedPos = monthPositionsRef.current[currentMonthKey];
+      const cardX = savedPos ? savedPos.x : getMonthX(focusedYear, focusedMonth);
+      const cardY = savedPos ? savedPos.y : 0;
+
+      const targetX = (clientWidth - pageWidth * s) / 2 - cardX * s;
+      const targetY = Math.max(40, (clientHeight - calH * s) / 2) - cardY * s;
+
+      applyTransform(s, targetX, targetY);
+      setOffset({ x: targetX, y: targetY });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
 
   // ─── Auto-save ──────────────────────────────────────────────────────
 
-  const saveToLocalStorage = useCallback((updatedData: PlannerData) => {
-    localStorage.setItem("planner-data", JSON.stringify(updatedData));
-  }, []);
-
-  const saveToServer = useCallback((date: string, blocks: Block[]) => {
-    if (saveTimeout.current) clearTimeout(saveTimeout.current);
-    saveTimeout.current = setTimeout(() => {
-      fetch("/api/planner", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ date, blocks }),
-      });
-    }, 500);
-  }, []);
+  const saveEntryToSupabase = useCallback(
+    (date: string, blocks: Block[]) => {
+      const uid = userIdRef.current;
+      if (!uid) return;
+      if (saveTimeouts.current[date]) clearTimeout(saveTimeouts.current[date]);
+      saveTimeouts.current[date] = setTimeout(() => {
+        supabase
+          .from("planner_entries")
+          .upsert({ user_id: uid, date_key: date, blocks })
+          .then();
+      }, 500);
+    },
+    [supabase]
+  );
 
   const handleBlocksChange = useCallback(
     (date: string, blocks: Block[]) => {
       delete defaultBlocksRef.current[date];
-      setData((prev) => {
-        const next = { ...prev, [date]: blocks };
-        saveToLocalStorage(next);
-        return next;
-      });
-      
-      // ONLY sync to JSON file if on local network
-      if (isLocalNetwork()) {
-        saveToServer(date, blocks);
-      }
+      setData((prev) => ({ ...prev, [date]: blocks }));
+      saveEntryToSupabase(date, blocks);
     },
-    [saveToLocalStorage, saveToServer]
+    [saveEntryToSupabase]
   );
 
   const getBlocks = useCallback(
@@ -423,9 +543,18 @@ export default function Home() {
       }
 
       if (hasChanges) {
-        saveToLocalStorage(merged);
-        if (isLocalNetwork()) {
-          changedDates.forEach(date => saveToServer(date, merged[date]));
+        const uid = userIdRef.current;
+        if (uid) {
+          supabase
+            .from("planner_entries")
+            .upsert(
+              changedDates.map((date) => ({
+                user_id: uid,
+                date_key: date,
+                blocks: merged[date],
+              }))
+            )
+            .then();
         }
       }
 
@@ -433,33 +562,30 @@ export default function Home() {
     });
 
     if (importedDocs.length > 0) {
-      setMonthPositions(prev => {
-        let hasNew = false;
-        const next = { ...prev };
-        let offsetX = 0;
-        let centerX = 100;
-        let centerY = 100;
-        if (canvasRef.current) {
-          const rect = canvasRef.current.getBoundingClientRect();
-          centerX = (rect.width / 2 - offsetRef.current.x) / scaleRef.current;
-          centerY = (rect.height / 2 - offsetRef.current.y) / scaleRef.current;
-        }
+      const prev = monthPositionsRef.current;
+      let hasNew = false;
+      const next = { ...prev };
+      let offsetX = 0;
+      let centerX = 100;
+      let centerY = 100;
+      if (canvasRef.current) {
+        const rect = canvasRef.current.getBoundingClientRect();
+        centerX = (rect.width / 2 - offsetRef.current.x) / scaleRef.current;
+        centerY = (rect.height / 2 - offsetRef.current.y) / scaleRef.current;
+      }
 
-        for (const docId of importedDocs) {
-          if (!next[docId]) {
-            hasNew = true;
-            next[docId] = { x: centerX + offsetX, y: centerY };
-            offsetX += 340;
-          }
+      for (const docId of importedDocs) {
+        if (!next[docId]) {
+          hasNew = true;
+          next[docId] = { x: centerX + offsetX, y: centerY };
+          offsetX += 340;
         }
-        if (hasNew) {
-          localStorage.setItem("planner-month-positions", JSON.stringify(next));
-          return next;
-        }
-        return prev;
-      });
+      }
+      if (hasNew) {
+        saveMonthPositions(next);
+      }
     }
-  }, [saveToLocalStorage, saveToServer]);
+  }, [supabase, saveMonthPositions]);
 
   const importFromFile = useCallback(() => {
     const input = document.createElement("input");
@@ -559,7 +685,14 @@ export default function Home() {
 
       if (canvasRef.current) {
         const { clientWidth, clientHeight } = canvasRef.current;
-        const targetX = getMonthX(y, m);
+        // Use the month's actual saved card position if it has one — matches
+        // how monthPages renders it. Falling back to the grid formula here
+        // (ignoring a saved position) is what used to make the camera pan to
+        // a spot unrelated to where the card was actually drawn.
+        const key = `${y}-${m}`;
+        const savedPos = monthPositionsRef.current[key];
+        const targetX = savedPos ? savedPos.x : getMonthX(y, m);
+        const targetCardY = savedPos ? savedPos.y : 0;
         const weeks = getMonthWeeks(y, m);
         const calH =
           TITLE_HEIGHT + HEADER_HEIGHT + weeks.length * DEFAULT_ROW_HEIGHT;
@@ -571,7 +704,7 @@ export default function Home() {
         //   =>  offset = (clientWidth - pageWidth * s) / 2 - targetX * s
         animateToOffset(
           (clientWidth - pageWidth * s) / 2 - targetX * s,
-          Math.max(40, (clientHeight - calH * s) / 2)
+          Math.max(40, (clientHeight - calH * s) / 2) - targetCardY * s
         );
       }
     },
@@ -585,7 +718,7 @@ export default function Home() {
   const goToToday = () =>
     navigateToMonth(today.getFullYear(), today.getMonth());
   const centerCalendar = () =>
-    navigateToMonth(focusedYearRef.current, focusedMonthRef.current);
+    navigateToMonth(today.getFullYear(), today.getMonth());
 
   // ─── Canvas wheel handler (pan + pinch-zoom) ─────────────────────────
 
@@ -781,10 +914,7 @@ export default function Home() {
     };
 
     const handleMouseUp = () => {
-      setMonthPositions((prev) => {
-        localStorage.setItem("planner-month-positions", JSON.stringify(prev));
-        return prev;
-      });
+      saveMonthPositions((prev) => prev);
       setDraggingMonth(null);
     };
 
@@ -794,7 +924,7 @@ export default function Home() {
       document.removeEventListener("mousemove", handleMouseMove);
       document.removeEventListener("mouseup", handleMouseUp);
     };
-  }, [draggingMonth, monthPositions, saveMonthPositions]);
+  }, [draggingMonth, saveMonthPositions]);
 
   // ─── Resize handlers (col + row) ─────────────────────────────────────
 
@@ -960,7 +1090,8 @@ export default function Home() {
             let isOverlapping = true;
             while (isOverlapping) {
               isOverlapping = false;
-              for (const pos of Object.values(monthPositions)) {
+              for (const pos of Object.values(monthPositionsRef.current)) {
+                if (pos.name === REMOVED_MONTH_MARKER) continue;
                 if (Math.abs(pos.x - centerX) < 20 && Math.abs(pos.y - centerY) < 20) {
                   isOverlapping = true;
                   centerX += 40;
@@ -970,8 +1101,7 @@ export default function Home() {
               }
             }
 
-            const nextPositions = { ...monthPositions, [id]: { x: centerX, y: centerY } };
-            saveMonthPositions(nextPositions);
+            saveMonthPositions((prev) => ({ ...prev, [id]: { x: centerX, y: centerY } }));
             setSelectedMonth(id);
           }} className="hidden sm:inline-flex">
             + Document
@@ -983,6 +1113,20 @@ export default function Home() {
           <Button variant="outline" size="xs" onClick={() => setShowImportModal(true)} title="Import data">
             Import
           </Button>
+          <div className="w-px h-4 bg-neutral-200" />
+          <Popover>
+            <PopoverTrigger
+              render={<Button variant="ghost" size="icon-xs" title={userEmail ?? undefined} />}
+            >
+              {(userEmail?.[0] ?? "?").toUpperCase()}
+            </PopoverTrigger>
+            <PopoverContent align="end" className="w-56">
+              <p className="text-xs text-neutral-500 truncate px-1">{userEmail}</p>
+              <Button variant="outline" size="xs" className="w-full" onClick={handleSignOut}>
+                Sign out
+              </Button>
+            </PopoverContent>
+          </Popover>
           <span className="hidden lg:inline text-[11px] text-neutral-400 select-none ml-1">
             Pinch to zoom · Scroll to pan ·{" "}
             <kbd className="px-1 py-0.5 bg-neutral-100 rounded text-[10px] font-mono">
@@ -1044,6 +1188,7 @@ export default function Home() {
               page.year === focusedYear && page.month === focusedMonth;
             const monthKey = `${page.year}-${page.month}`;
             const isSelected = selectedMonth === monthKey;
+            const hasCustomPosition = monthPositions[monthKey] !== undefined;
 
             return (
               <div
@@ -1101,6 +1246,34 @@ export default function Home() {
                     >
                       ›
                     </button>
+                    {hasCustomPosition && (
+                      <button
+                        className="text-neutral-400 hover:text-red-500 text-xs px-1 rounded hover:bg-neutral-100 transition-colors"
+                        title="Remove from canvas (day notes are kept)"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (
+                            !confirm(
+                              `Remove ${MONTH_NAMES[page.month]} ${page.year} from the canvas? Its day notes won't be deleted.`
+                            )
+                          )
+                            return;
+                          saveMonthPositions((prev) => {
+                            const next = { ...prev };
+                            next[monthKey] = {
+                              x: page.x,
+                              y: page.y,
+                              name: REMOVED_MONTH_MARKER,
+                            };
+                            return next;
+                          });
+                          if (selectedMonth === monthKey) setSelectedMonth(null);
+                        }}
+                        onMouseDown={(e) => e.stopPropagation()}
+                      >
+                        ×
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -1360,10 +1533,10 @@ export default function Home() {
                     e.stopPropagation();
                     const newName = prompt("Rename document:", page.name || "Document");
                     if (newName !== null) {
-                      saveMonthPositions({
-                        ...monthPositions,
-                        [page.id]: { ...monthPositions[page.id], name: newName.trim() }
-                      });
+                      saveMonthPositions((prev) => ({
+                        ...prev,
+                        [page.id]: { ...prev[page.id], name: newName.trim() }
+                      }));
                     }
                   }}
                 >
@@ -1375,22 +1548,33 @@ export default function Home() {
                     onClick={(e) => {
                       e.preventDefault();
                       e.stopPropagation();
-                      
+
                       const blocks = data[page.id];
                       const isEmpty = !blocks || blocks.length === 0 || (blocks.length === 1 && !blocks[0].content);
-                      
+
                       if (!isEmpty) {
                         if (!confirm("This document has content. Are you sure you want to delete it?")) return;
                       }
 
-                      const next = { ...monthPositions };
-                      delete next[page.id];
-                      saveMonthPositions(next);
-                      
+                      saveMonthPositions((prev) => {
+                        const next = { ...prev };
+                        delete next[page.id];
+                        return next;
+                      });
+
                       const nextData = { ...data };
                       delete nextData[page.id];
                       setData(nextData);
-                      saveToLocalStorage(nextData);
+
+                      const uid = userIdRef.current;
+                      if (uid) {
+                        supabase
+                          .from("planner_entries")
+                          .delete()
+                          .eq("user_id", uid)
+                          .eq("date_key", page.id)
+                          .then();
+                      }
                     }}
                     onMouseDown={(e) => e.stopPropagation()}
                     onTouchStart={(e) => e.stopPropagation()}
@@ -1527,7 +1711,10 @@ export default function Home() {
             <div className="grid grid-cols-3 gap-2">
               {MONTH_NAMES.map((name, mi) => {
                 const key = `${pickerYear}-${mi}`;
-                const alreadyExists = monthPositions[key] !== undefined ||
+                const position = monthPositions[key];
+                const alreadyExists =
+                  (position !== undefined &&
+                    position.name !== REMOVED_MONTH_MARKER) ||
                   monthPages.some((p) => p.year === pickerYear && p.month === mi);
                 return (
                   <button
@@ -1539,19 +1726,22 @@ export default function Home() {
                         : "bg-neutral-50 hover:bg-blue-50 hover:text-blue-700 text-neutral-700"
                     }`}
                     onClick={() => {
-                      // Place new month near center of viewport
-                      const s = scaleRef.current;
-                      const ox = offsetRef.current.x;
-                      const oy = offsetRef.current.y;
-                      const canvas = canvasRef.current;
-                      const cx = canvas ? (canvas.clientWidth / 2 - ox) / s : 0;
-                      const cy = canvas ? (canvas.clientHeight / 2 - oy) / s : 0;
-
-                      const newPositions = {
-                        ...monthPositions,
-                        [key]: { x: cx - pageWidth / 2, y: cy - 200 },
+                      // Place it at its natural grid position — same spacing
+                      // as the default sliding-window months — rather than
+                      // wherever the camera currently happens to be pointed.
+                      const newPos = { x: getMonthX(pickerYear, mi), y: 0 };
+                      // Update the ref synchronously so the navigateToMonth
+                      // call right below sees this position immediately —
+                      // setState's functional updater (inside
+                      // saveMonthPositions) only runs on the next render.
+                      monthPositionsRef.current = {
+                        ...monthPositionsRef.current,
+                        [key]: newPos,
                       };
-                      saveMonthPositions(newPositions);
+                      saveMonthPositions((prev) => {
+                        const next = { ...prev, [key]: newPos };
+                        return next;
+                      });
                       setShowMonthPicker(false);
                       navigateToMonth(pickerYear, mi);
                     }}

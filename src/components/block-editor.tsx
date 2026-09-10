@@ -12,6 +12,15 @@ import { Block } from "@/lib/types";
 
 // ─── Slash commands ─────────────────────────────────────────────────────────
 
+const HIGHLIGHT_COLORS = [
+  { color: "#fef08a", label: "Yellow" },
+  { color: "#bbf7d0", label: "Green" },
+  { color: "#bfdbfe", label: "Blue" },
+  { color: "#fbcfe8", label: "Pink" },
+];
+
+const HIGHLIGHT_DEFAULT = "#fef08a";
+
 const SLASH_COMMANDS = [
   { command: "/todo", label: "To-do", type: "todo" as const, icon: "☐" },
   { command: "/list", label: "Bullet List", type: "list" as const, icon: "•" },
@@ -43,7 +52,10 @@ function getSafeHTML(content: string): string {
   if (
     content.includes("<sup>") ||
     content.includes("<sub>") ||
-    content.includes("<br>")
+    content.includes("<b>") ||
+    content.includes("<strong>") ||
+    content.includes("<br>") ||
+    content.includes("<mark")
   ) {
     return content;
   }
@@ -55,7 +67,10 @@ function cleanEmptyTags(html: string): string {
   let cleaned = html.replace(/\u200B/g, "");
   cleaned = cleaned
     .replace(/<sup[^>]*>\s*<\/sup>/gi, "")
-    .replace(/<sub[^>]*>\s*<\/sub>/gi, "");
+    .replace(/<sub[^>]*>\s*<\/sub>/gi, "")
+    .replace(/<b[^>]*>\s*<\/b>/gi, "")
+    .replace(/<strong[^>]*>\s*<\/strong>/gi, "")
+    .replace(/<mark[^>]*>\s*<\/mark>/gi, "");
   return cleaned;
 }
 
@@ -79,10 +94,18 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
   const [history, setHistory] = useState<Block[][]>([blocks]);
   const [currentHistoryIndex, setCurrentHistoryIndex] = useState(0);
   const [focusedId, setFocusedId] = useState<string | null>(null);
-  
+  const [selectedBlockIds, setSelectedBlockIds] = useState<string[]>([]);
+  const [selectionToolbar, setSelectionToolbar] = useState<{ x: number; y: number; blockId: string } | null>(null);
+
   const blockRefs = useRef<Record<string, HTMLElement | null>>({});
   const pendingFocusId = useRef<string | null>(null);
+  const pendingCaret = useRef<{ blockId: string; offset: number } | null>(null);
   const isUndoRedoing = useRef(false);
+  const selectionAnchorRef = useRef<string | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const isShiftSelectingRef = useRef(false);
+  const mouseDownBlockIdRef = useRef<string | null>(null);
+  const isDragSelectingRef = useRef(false);
 
   useEffect(() => setMounted(true), []);
 
@@ -97,6 +120,41 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
   // ─── Focus management ──────────────────────────────────────────────────
 
   useEffect(() => {
+    if (pendingCaret.current) {
+      const { blockId, offset } = pendingCaret.current;
+      const el = blockRefs.current[blockId];
+      pendingCaret.current = null;
+
+      if (el) {
+        el.focus();
+        const range = document.createRange();
+        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+        let remaining = offset;
+        let textNode = walker.nextNode();
+
+        while (textNode) {
+          const length = textNode.textContent?.length ?? 0;
+          if (remaining <= length) {
+            range.setStart(textNode, remaining);
+            range.collapse(true);
+            const sel = window.getSelection();
+            sel?.removeAllRanges();
+            sel?.addRange(range);
+            return;
+          }
+          remaining -= length;
+          textNode = walker.nextNode();
+        }
+
+        range.selectNodeContents(el);
+        range.collapse(false);
+        const sel = window.getSelection();
+        sel?.removeAllRanges();
+        sel?.addRange(range);
+      }
+      return;
+    }
+
     if (pendingFocusId.current) {
       const el = blockRefs.current[pendingFocusId.current];
       if (el) {
@@ -117,6 +175,17 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
   });
 
   // ─── History management ─────────────────────────────────────────────
+
+  const rememberCaret = useCallback((blockId: string) => {
+    const el = blockRefs.current[blockId];
+    const sel = window.getSelection();
+    if (!el || !sel?.anchorNode || !el.contains(sel.anchorNode)) return;
+
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    range.setEnd(sel.anchorNode, sel.anchorOffset);
+    pendingCaret.current = { blockId, offset: range.toString().length };
+  }, []);
 
   const pushToHistory = useCallback((newBlocks: Block[]) => {
     if (isUndoRedoing.current) return;
@@ -174,6 +243,120 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
     [blocks, updateBlocks]
   );
 
+  const handleBlockSelect = useCallback(
+    (id: string, extend: boolean) => {
+      if (extend && selectionAnchorRef.current) {
+        const anchorIdx = blocks.findIndex((b) => b.id === selectionAnchorRef.current);
+        const targetIdx = blocks.findIndex((b) => b.id === id);
+        if (anchorIdx !== -1 && targetIdx !== -1) {
+          const start = Math.min(anchorIdx, targetIdx);
+          const end = Math.max(anchorIdx, targetIdx);
+          setSelectedBlockIds(blocks.slice(start, end + 1).map((b) => b.id));
+          return;
+        }
+      }
+      setSelectedBlockIds([id]);
+      selectionAnchorRef.current = id;
+    },
+    [blocks]
+  );
+
+  const applyHighlight = useCallback((blockId: string, color: string) => {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+    const range = sel.getRangeAt(0);
+    const el = blockRefs.current[blockId];
+    if (!el) return;
+
+    // If already inside a mark, just change its color
+    let node: Node | null = range.commonAncestorContainer;
+    while (node && node !== el) {
+      if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === "MARK") {
+        (node as HTMLElement).style.backgroundColor = color;
+        updateBlock(blockId, { content: el.innerHTML });
+        return;
+      }
+      node = node.parentNode;
+    }
+
+    const mark = document.createElement("mark");
+    mark.style.backgroundColor = color;
+    mark.appendChild(range.extractContents());
+    range.insertNode(mark);
+    range.selectNodeContents(mark);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    updateBlock(blockId, { content: el.innerHTML });
+  }, [updateBlock]);
+
+  const removeHighlight = useCallback((blockId: string) => {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+    const range = sel.getRangeAt(0);
+    const el = blockRefs.current[blockId];
+    if (!el) return;
+
+    let node: Node | null = range.commonAncestorContainer;
+    while (node && node !== el) {
+      if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === "MARK") {
+        const mark = node as HTMLElement;
+        const parent = mark.parentNode!;
+        while (mark.firstChild) parent.insertBefore(mark.firstChild, mark);
+        parent.removeChild(mark);
+        updateBlock(blockId, { content: el.innerHTML });
+        return;
+      }
+      node = node.parentNode;
+    }
+  }, [updateBlock]);
+
+  const toggleBold = useCallback((blockId: string) => {
+    const sel = window.getSelection();
+    const el = blockRefs.current[blockId];
+    if (!sel || sel.rangeCount === 0 || !el) return;
+
+    const range = sel.getRangeAt(0);
+    if (!el.contains(range.commonAncestorContainer)) return;
+
+    document.execCommand("bold");
+    updateBlock(blockId, { content: el.innerHTML });
+  }, [updateBlock]);
+
+  // Show color toolbar when text is selected inside any block
+  useEffect(() => {
+    const onSelectionChange = () => {
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed) { setSelectionToolbar(null); return; }
+      const range = sel.getRangeAt(0);
+      for (const [id, el] of Object.entries(blockRefs.current)) {
+        if (el && el.contains(range.commonAncestorContainer)) {
+          const rect = range.getBoundingClientRect();
+          if (rect.width > 0) {
+            setSelectionToolbar({ x: rect.left + rect.width / 2, y: rect.top, blockId: id });
+          }
+          return;
+        }
+      }
+      setSelectionToolbar(null);
+    };
+    document.addEventListener("selectionchange", onSelectionChange);
+    return () => document.removeEventListener("selectionchange", onSelectionChange);
+  }, []);
+
+  // Clean up drag-select on mouseup
+  useEffect(() => {
+    const onMouseUp = () => {
+      mouseDownBlockIdRef.current = null;
+      if (isDragSelectingRef.current) {
+        isDragSelectingRef.current = false;
+        if (containerRef.current) containerRef.current.style.userSelect = "";
+        containerRef.current?.focus();
+      }
+    };
+    document.addEventListener("mouseup", onMouseUp);
+    return () => document.removeEventListener("mouseup", onMouseUp);
+  }, []);
+
   const addBlockAfter = useCallback(
     (afterId: string, type: Block["type"] = "text") => {
       const newBlock: Block = { id: generateId(), type, content: "" };
@@ -230,16 +413,36 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
 
   const handlePaste = useCallback(
     (id: string, e: React.ClipboardEvent) => {
-      const text = e.clipboardData.getData("text");
+      e.preventDefault();
+      const text = e.clipboardData.getData("text/plain") || e.clipboardData.getData("text") || "";
+      if (!text) return;
+
       const lines = text.split(/\r?\n/).filter((line) => line.trim() !== "");
+      if (lines.length === 0) return;
 
-      // If it's multi-line or starts with markdown-like indicators, split into blocks
+      // Single plain line with no markdown indicators: insert at cursor as plain text
       if (
-        lines.length > 1 ||
-        lines[0].match(/^([-*] |[0-9]+\. |- ?\[[ xX]?\]\s|# |> )/)
+        lines.length === 1 &&
+        !lines[0].match(/^([-*] |[0-9]+\. |- ?\[[ xX]?\]\s|# |> )/)
       ) {
-        e.preventDefault();
+        const sel = window.getSelection();
+        if (sel && sel.rangeCount > 0) {
+          const range = sel.getRangeAt(0);
+          range.deleteContents();
+          const textNode = document.createTextNode(lines[0]);
+          range.insertNode(textNode);
+          range.setStartAfter(textNode);
+          range.collapse(true);
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }
+        const el = blockRefs.current[id];
+        if (el) updateBlock(id, { content: el.innerHTML });
+        return;
+      }
 
+      // Multi-line or markdown paste: split into blocks
+      {
         const idx = blocks.findIndex((b) => b.id === id);
         const currentBlock = blocks[idx];
         const newBlocks: Block[] = [];
@@ -302,7 +505,7 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
         pendingFocusId.current = newBlocks[newBlocks.length - 1].id;
       }
     },
-    [blocks, updateBlocks]
+    [blocks, updateBlocks, updateBlock]
   );
 
   const handleInput = useCallback(
@@ -593,11 +796,47 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
       // Undo (Cmd+Z)
       if ((e.metaKey || e.ctrlKey) && e.key === "z") {
         e.preventDefault();
+        rememberCaret(id);
         if (e.shiftKey) {
           redo();
         } else {
           undo();
         }
+        return;
+      }
+
+      // Highlight toggle (Ctrl+H / Cmd+H)
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "h") {
+        e.preventDefault();
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+        const range = sel.getRangeAt(0);
+        const blockEl = e.currentTarget as HTMLElement;
+        let node: Node | null = range.commonAncestorContainer;
+        let insideMark: HTMLElement | null = null;
+        while (node && node !== blockEl) {
+          if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === "MARK") {
+            insideMark = node as HTMLElement;
+            break;
+          }
+          node = node.parentNode;
+        }
+        if (insideMark) {
+          const parent = insideMark.parentNode!;
+          while (insideMark.firstChild) parent.insertBefore(insideMark.firstChild, insideMark);
+          parent.removeChild(insideMark);
+          updateBlock(id, { content: blockEl.innerHTML });
+        } else {
+          applyHighlight(id, HIGHLIGHT_DEFAULT);
+        }
+        return;
+      }
+
+      // Bold toggle (Ctrl+B / Cmd+B)
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        toggleBold(id);
+        return;
       }
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
@@ -656,6 +895,9 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
       addBlockAfter,
       deleteBlock,
       updateBlock,
+      applyHighlight,
+      toggleBold,
+      rememberCaret,
     ]
   );
 
@@ -717,7 +959,9 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
             key={block.id}
             className={`py-px ${blockStyle(block.type)} text-neutral-300`}
             dangerouslySetInnerHTML={{
-              __html: getSafeHTML(block.content) || placeholderText(block.type),
+              __html:
+                getSafeHTML(block.content) ||
+                (block.type === "text" ? "" : placeholderText(block.type)),
             }}
           />
         ))}
@@ -729,14 +973,50 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
 
   return (
     <>
-      <div 
+      <div
+        ref={containerRef}
         className="space-y-px outline-none select-text"
         tabIndex={-1}
         onKeyDown={(e) => {
+          // Handle selected blocks
+          if (selectedBlockIds.length > 0) {
+            if (e.key === "Escape") {
+              setSelectedBlockIds([]);
+              return;
+            }
+            if ((e.metaKey || e.ctrlKey) && e.key === "c") {
+              const ordered = blocks.filter((b) => selectedBlockIds.includes(b.id));
+              const text = ordered.map((b) => {
+                const prefix =
+                  b.type === "todo" ? `- [${b.checked ? "x" : " "}] ` :
+                  b.type === "list" ? "- " :
+                  b.type === "number" ? `${blocks.filter((x, i) => x.type === "number" && i <= blocks.indexOf(b)).length}. ` :
+                  b.type === "h1" ? "# " :
+                  b.type === "h2" ? "## " :
+                  b.type === "h3" ? "### " :
+                  b.type === "quote" ? "> " :
+                  b.type === "divider" ? "---" : "";
+                const tmp = document.createElement("div");
+                tmp.innerHTML = b.content;
+                return prefix + (b.type === "divider" ? "" : (tmp.textContent || ""));
+              }).join("\n");
+              navigator.clipboard.writeText(text);
+              return;
+            }
+            if ((e.key === "Backspace" || e.key === "Delete") && e.target === e.currentTarget) {
+              e.preventDefault();
+              const remaining = blocks.filter((b) => !selectedBlockIds.includes(b.id));
+              const newBlocks = remaining.length > 0 ? remaining : [{ id: generateId(), type: "text" as const, content: "" }];
+              updateBlocks(newBlocks);
+              setSelectedBlockIds([]);
+              pendingFocusId.current = newBlocks[0].id;
+              return;
+            }
+          }
+
           if (e.key === "Backspace" || e.key === "Delete") {
             const sel = window.getSelection();
             if (sel && !sel.isCollapsed) {
-              // If selection spans multiple blocks or is the container
               if (sel.anchorNode !== sel.focusNode || e.target === e.currentTarget) {
                 e.preventDefault();
                 const firstBlockId = generateId();
@@ -748,14 +1028,38 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
         }}
       >
         {blocks.map((block) => (
-          <div 
-            key={block.id} 
-            className="relative flex items-start gap-1.5 group/block cursor-text"
-            onClick={(e) => {
-              // If clicking the container (gutter), focus the editable area
-              const target = e.target as HTMLElement;
-              if (target.classList.contains('group/block') || target.tagName === 'DIV' && !target.hasAttribute('contenteditable')) {
-                blockRefs.current[block.id]?.focus();
+          <div
+            key={block.id}
+            className={`relative flex items-start gap-1.5 group/block cursor-text rounded-[2px] ${
+              selectedBlockIds.includes(block.id) ? "bg-blue-50 ring-1 ring-blue-100" : ""
+            }`}
+            onMouseDown={(e) => {
+              mouseDownBlockIdRef.current = block.id;
+              if (e.shiftKey) {
+                e.preventDefault();
+                isShiftSelectingRef.current = true;
+                handleBlockSelect(block.id, true);
+                containerRef.current?.focus();
+              } else {
+                isShiftSelectingRef.current = false;
+                selectionAnchorRef.current = block.id;
+                if (selectedBlockIds.length > 0) {
+                  setSelectedBlockIds([]);
+                }
+              }
+            }}
+            onMouseEnter={(e) => {
+              if (
+                e.buttons === 1 &&
+                mouseDownBlockIdRef.current &&
+                mouseDownBlockIdRef.current !== block.id
+              ) {
+                if (!isDragSelectingRef.current) {
+                  isDragSelectingRef.current = true;
+                  window.getSelection()?.removeAllRanges();
+                  if (containerRef.current) containerRef.current.style.userSelect = "none";
+                }
+                handleBlockSelect(block.id, true);
               }
             }}
           >
@@ -813,6 +1117,10 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
                   onPaste={(e) => handlePaste(block.id, e)}
                   onFocus={() => {
                     setFocusedId(block.id);
+                    if (!isShiftSelectingRef.current) {
+                      setSelectedBlockIds([]);
+                    }
+                    isShiftSelectingRef.current = false;
                     if (slashMenu && slashMenu.blockId !== block.id)
                       setSlashMenu(null);
                   }}
@@ -836,7 +1144,9 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
               )}
 
               {/* Placeholder overlay */}
-              {!block.content && block.type !== "divider" && (
+              {!block.content &&
+                block.type !== "divider" &&
+                (block.type !== "text" || focusedId === block.id) && (
                 <div className="absolute inset-0 pointer-events-none text-neutral-300 py-px text-xs select-none">
                   {placeholderText(block.type)}
                 </div>
@@ -886,6 +1196,58 @@ export default function BlockEditor({ blocks, onChange }: BlockEditorProps) {
                 </span>
               </button>
             ))}
+          </div>,
+          document.body
+        )}
+
+      {/* Highlight color toolbar — floats above text selection */}
+      {selectionToolbar &&
+        mounted &&
+        createPortal(
+          <div
+            className="fixed flex items-center gap-0.5 p-1 rounded-lg bg-white border border-neutral-200 shadow-lg"
+            style={{
+              left: selectionToolbar.x,
+              top: selectionToolbar.y - 8,
+              transform: "translateX(-50%) translateY(-100%)",
+              zIndex: 9999,
+            }}
+            onMouseDown={(e) => e.preventDefault()}
+          >
+            {HIGHLIGHT_COLORS.map(({ color, label }) => (
+              <button
+                key={color}
+                title={label}
+                className="w-5 h-5 rounded-sm border border-transparent hover:scale-110 transition-transform"
+                style={{ backgroundColor: color }}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  applyHighlight(selectionToolbar.blockId, color);
+                }}
+              />
+            ))}
+            <button
+              type="button"
+              title="Unhighlight"
+              aria-label="Unhighlight"
+              className="h-5 w-5 rounded-sm border border-neutral-200 bg-white hover:scale-110 transition-transform"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                removeHighlight(selectionToolbar.blockId);
+              }}
+            />
+            <button
+              type="button"
+              title="Bold"
+              aria-label="Bold"
+              className="h-5 w-5 rounded-sm bg-white text-xs font-bold text-neutral-700 hover:bg-neutral-50 hover:text-neutral-950 transition-colors"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                toggleBold(selectionToolbar.blockId);
+              }}
+            >
+              B
+            </button>
           </div>,
           document.body
         )}
